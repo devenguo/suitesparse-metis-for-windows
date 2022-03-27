@@ -1,8 +1,8 @@
 function test97
 %TEST97 test GB_assign, scalar expansion and zombies
 
-% SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2018, All Rights Reserved.
-% http://suitesparse.com   See GraphBLAS/Doc/License.txt for license.
+% SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2022, All Rights Reserved.
+% SPDX-License-Identifier: Apache-2.0
 
 rng ('default') ;
 
@@ -33,7 +33,7 @@ rng ('default') ;
         Work (k+1).scalar = 1 ;
     end
 
-    C1 = GB_mex_assign  (C, Work) ;
+    C1 = GB_mex_assign  (C, Work) ; % WORK_ASSIGN
 
     C2 = C ;
     for k = 1:ntrials

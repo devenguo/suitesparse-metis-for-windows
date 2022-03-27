@@ -19,8 +19,8 @@ T = $(TCOV_TMP)/CHOLMOD_TCOV_TMP
 
 # Tcov requires gcc
 CC = gcc
-BLAS = -lrefblas -lgfortran
-LAPACK = -llapack
+# BLAS = -lrefblas -lgfortran
+# LAPACK = -llapack
 
 # to test Tcov without METIS, but with CAMD, CCOLAMD, and CSYMAMD:
 # C = $(CC) $(CF) $(CHOLMOD_CONFIG) $(NANTESTS) -DNPARTITION
@@ -1252,7 +1252,7 @@ l_super_solve.o: ../Supernodal/cholmod_super_solve.c
 cholmod_gpu_kernels.o: ../GPU/cholmod_gpu_kernels.c \
         ../GPU/cholmod_gpu_kernels.cu
 	$(C) -DDLONG -c $(I) $<
-	$(NVCC) -I../../SuiteSparse_config -Xcompiler -fPIC -O3  -gencode=arch=compute_20,code=sm_20 -gencode=arch=compute_30,code=sm_30 -gencode=arch=compute_35,code=sm_35 -c ../GPU/cholmod_gpu_kernels.cu
+	$(NVCC) -I../../SuiteSparse_config -Xcompiler -fPIC -O3 -c ../GPU/cholmod_gpu_kernels.cu
 
 #-------------------------------------------------------------------------------
 

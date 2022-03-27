@@ -1,8 +1,11 @@
 function test88
-%TEST88 test hypersparse matrices with heap-based method
+%TEST88 test hypersparse matrices with hash-based method
+
+% SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2022, All Rights Reserved.
+% SPDX-License-Identifier: Apache-2.0
 
 rng ('default') ;
-d.axb = 'heap' ;
+d.axb = 'hash' ;
 semiring.multiply = 'times' ;
 semiring.class = 'double' ;
 semiring.add = 'plus' ;
@@ -22,10 +25,10 @@ for n = [10 100 200 300 1000]
 
         C1 = A.matrix * B.matrix ;
         C2 = GB_mex_mxm (S, [ ], [ ], semiring, A, B, d) ;
-        [t method] = gbresults ;
-        assert (isequal (method, 'heap')) ;
+
         assert (isequal_roundoff (C1, C2.matrix)) ;
     end
 end
 
 fprintf ('test88: all tests passed\n') ;
+

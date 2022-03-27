@@ -1,8 +1,11 @@
 function test_other
 %TEST_OTHER installs all packages needed for extensive tests
 
+% SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2022, All Rights Reserved.
+% SPDX-License-Identifier: Apache-2.0
+
 here = pwd ;
-fprintf ('\n------------------installing ssget:\n') ;
+fprintf ('\n------------------installing ssget\n') ;
 try
     index = ssget ;
 catch
@@ -11,10 +14,7 @@ catch
 end
 cd (here) ;
 
-fprintf ('\n------------------installing GraphBLAS/Demo/MATLAB:\n') ;
-addpath ../Demo/MATLAB
-
-fprintf ('\n------------------installing spok:\n') ;
+fprintf ('\n------------------installing spok\n') ;
 cd spok
 addpath (pwd) ;
 try
@@ -24,8 +24,8 @@ catch
 end
 cd (here) ;
 
-fprintf ('\n------------------installing SSMULT:\n') ;
-cd ../../MATLAB_Tools/SSMULT
+fprintf ('\n------------------installing SSMULT\n') ;
+cd ../../SuiteSparse/MATLAB_Tools/SSMULT
 addpath (pwd) ;
 try
     L = sparse (1) ;
@@ -35,8 +35,8 @@ catch
 end
 cd (here) ;
 
-fprintf ('\n------------------installing CXSparse:\n') ;
-cd ../../CXSparse/MATLAB/Csparse
+fprintf ('\n------------------installing CXSparse\n') ;
+cd ../../SuiteSparse/CXSparse/MATLAB/CSparse
 addpath (pwd) ;
 try
     cs_sparse (1, 1, 1) ;
@@ -45,8 +45,8 @@ catch
 end
 cd (here) ;
 
-fprintf ('\n------------------installing CHOLMOD:\n') ;
-cd ../../CHOLMOD/MATLAB
+fprintf ('\n------------------installing CHOLMOD\n') ;
+cd ../../SuiteSparse/CHOLMOD/MATLAB
 addpath (pwd) ;
 try
     sparse2 (1, 1, 1) ;

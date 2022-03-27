@@ -2,29 +2,22 @@
 // GrB_finalize: finalize GraphBLAS
 //------------------------------------------------------------------------------
 
-// SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2018, All Rights Reserved.
-// http://suitesparse.com   See GraphBLAS/Doc/License.txt for license.
+// SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2022, All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 //------------------------------------------------------------------------------
 
 // GrB_finalize must be called as the last GraphBLAS function, per the
-// GraphBLAS C API Specification.  
+// GraphBLAS C API Specification.  Only one user thread can call this function.
+// Results are undefined if more than one thread calls this function at the
+// same time.
 
 #include "GB.h"
 
 GrB_Info GrB_finalize ( )
 { 
-
-    //--------------------------------------------------------------------------
-    // destroy the queue
-    //--------------------------------------------------------------------------
-
-    GB_CRITICAL (GB_queue_destroy ( )) ;
-
-    //--------------------------------------------------------------------------
-    // return result
-    //--------------------------------------------------------------------------
-
+    // free all memory pools
+    GB_free_pool_finalize ( ) ;
     return (GrB_SUCCESS) ;
 }
 

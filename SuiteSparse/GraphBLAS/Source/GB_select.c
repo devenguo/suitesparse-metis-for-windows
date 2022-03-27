@@ -1,28 +1,22 @@
 //------------------------------------------------------------------------------
-// GB_select: apply a select operator; optionally transpose a matrix
+// GB_select: apply a select operator
 //------------------------------------------------------------------------------
 
-// SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2018, All Rights Reserved.
-// http://suitesparse.com   See GraphBLAS/Doc/License.txt for license.
+// SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2022, All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 //------------------------------------------------------------------------------
 
-// C<M> = accum (C, select(A,k)) or select(A,k)').  This function is not
-// user-callable.  It does the work for GxB_*_select.
-// Compare this function with GrB_apply.
+// C<M> = accum (C, select(A,Thunk)) or select(A,Thunk)')
 
-#include "GB.h"
-
-static inline bool is_nonzero (const GB_void *value, int64_t size)
-{
-    for (int64_t i = 0 ; i < size ; i++)
-    {
-        if (value [i] != 0) return (true) ;
-    }
-    return (false) ;
+#define GB_FREE_ALL         \
+{                           \
+    GB_Matrix_free (&T) ;   \
 }
 
-//------------------------------------------------------------------------------
+#include "GB_select.h"
+#include "GB_accum_mask.h"
+#include "GB_transpose.h"
 
 GrB_Info GB_select          // C<M> = accum (C, select(A,k)) or select(A',k)
 (
@@ -30,10 +24,11 @@ GrB_Info GB_select          // C<M> = accum (C, select(A,k)) or select(A',k)
     const bool C_replace,           // C descriptor
     const GrB_Matrix M,             // optional mask for C, unused if NULL
     const bool Mask_comp,           // descriptor for M
+    const bool Mask_struct,         // if true, use the only structure of M
     const GrB_BinaryOp accum,       // optional accum for Z=accum(C,T)
-    const GxB_SelectOp op,          // operator to select the entries
+    const GB_Operator op,           // GxB_SelectOp or GrB_IndexUnaryOp
     const GrB_Matrix A,             // input matrix
-    const void *k,                  // optional input for select operator
+    const GrB_Scalar Thunk,         // optional input for select operator
     const bool A_transpose,         // A matrix descriptor
     GB_Context Context
 )
@@ -43,39 +38,81 @@ GrB_Info GB_select          // C<M> = accum (C, select(A,k)) or select(A',k)
     // check inputs
     //--------------------------------------------------------------------------
 
-    ASSERT (GB_ALIAS_OK2 (C, M, A)) ;
+    // C may be aliased with M and/or A
 
-    GB_RETURN_IF_FAULTY (accum) ;
+    GB_RETURN_IF_FAULTY_OR_POSITIONAL (accum) ;
+    GB_RETURN_IF_FAULTY (Thunk) ;
     GB_RETURN_IF_NULL_OR_FAULTY (op) ;
-    int64_t kk = 0 ;
-    if (op->opcode < GB_NONZERO_opcode)
-    { 
-        GB_RETURN_IF_NULL (k) ;
-        kk = *((int64_t *) k) ;
-    }
 
-    ASSERT_OK (GB_check (C, "C input for GB_select", GB0)) ;
-    ASSERT_OK_OR_NULL (GB_check (M, "M for GB_select", GB0)) ;
-    ASSERT_OK_OR_NULL (GB_check (accum, "accum for GB_select", GB0)) ;
-    ASSERT_OK (GB_check (op, "selectop for GB_select", GB0)) ;
-    ASSERT_OK (GB_check (A, "A input for GB_select", GB0)) ;
+    ASSERT_MATRIX_OK (C, "C input for GB_select", GB0) ;
+    ASSERT_MATRIX_OK_OR_NULL (M, "M for GB_select", GB0) ;
+    ASSERT_BINARYOP_OK_OR_NULL (accum, "accum for GB_select", GB0) ;
+    ASSERT_OP_OK (op, "selectop/indexunaryop for GB_select", GB0) ;
+    ASSERT_MATRIX_OK (A, "A input for GB_select", GB0) ;
+    ASSERT_SCALAR_OK_OR_NULL (Thunk, "Thunk for GB_select", GB0) ;
+
+    struct GB_Matrix_opaque T_header ;
+    GrB_Matrix T = NULL ;
 
     // check domains and dimensions for C<M> = accum (C,T)
-    GrB_Info info = GB_compatible (C->type, C, M, accum, A->type, Context) ;
-    if (info != GrB_SUCCESS)
+    GrB_Info info ;
+    GB_OK (GB_compatible (C->type, C, M, Mask_struct, accum, A->type, Context));
+
+    GB_Type_code acode = A->type->code ;
+    GB_Type_code xcode = (op->xtype == NULL) ? GB_ignore_code : op->xtype->code;
+    GB_Type_code tcode = GB_ignore_code ;
+    GB_Opcode opcode = op->opcode ;
+    bool op_is_selectop = GB_IS_SELECTOP_CODE (opcode) ;
+    bool op_is_idxunop  = GB_IS_INDEXUNARYOP_CODE (opcode) ;
+    ASSERT (op_is_selectop || op_is_idxunop) ;
+    ASSERT (opcode != GB_FLIPDIAGINDEX_idxunop_code) ;
+
+    if (op_is_idxunop)
     { 
-        return (info) ;
+        // Thunk is optional for GxB_Selectop, required for GrB_IndexUnaryOp
+        GB_RETURN_IF_NULL (Thunk) ;
+    }
+
+    // this opcodes are not available to the user
+    ASSERT (opcode != GB_NONZOMBIE_selop_code) ;
+
+    // check if the op is a GT, GE, LT, or LE comparator
+    bool op_is_ordered_comparator =
+        opcode == GB_GT_ZERO_selop_code || opcode == GB_GT_THUNK_selop_code ||
+        opcode == GB_GE_ZERO_selop_code || opcode == GB_GE_THUNK_selop_code ||
+        opcode == GB_LT_ZERO_selop_code || opcode == GB_LT_THUNK_selop_code ||
+        opcode == GB_LE_ZERO_selop_code || opcode == GB_LE_THUNK_selop_code ||
+        opcode == GB_VALUEGT_idxunop_code ||
+        opcode == GB_VALUEGE_idxunop_code ||
+        opcode == GB_VALUELT_idxunop_code ||
+        opcode == GB_VALUELE_idxunop_code ;
+
+    if (op_is_ordered_comparator)
+    {
+        // built-in GT, GE, LT, and LE operators cannot be used with
+        // user-defined or complex types.
+        if (acode == GB_UDT_code)
+        { 
+            GB_ERROR (GrB_DOMAIN_MISMATCH,
+                "Operator %s not defined for user-defined types", op->name) ;
+        }
+        else if (acode == GB_FC32_code || acode == GB_FC64_code)
+        { 
+            GB_ERROR (GrB_DOMAIN_MISMATCH,
+                "Operator %s not defined for complex types", op->name) ;
+        }
     }
 
     // C = op (A) must be compatible, already checked in GB_compatible
-    // A must also be compatible with op->xtype, unless op->xtype is NULL
-    if (op->xtype != NULL && !GB_Type_compatible (A->type, op->xtype))
+
+    // A must also be compatible with op->xtype
+    if (!GB_Type_compatible (A->type, op->xtype))
     { 
-        return (GB_ERROR (GrB_DOMAIN_MISMATCH, (GB_LOG,
-            "incompatible type for C=%s(A,k):\n"
+        GB_ERROR (GrB_DOMAIN_MISMATCH,
+            "Incompatible type for C=%s(A,Thunk):\n"
             "input A type [%s]\n"
-            "cannot be typecast to operator x of type [%s]",
-            op->name, A->type->name, op->xtype->name))) ;
+            "cannot be typecast to operator input of type [%s]",
+            op->name, A->type->name, op->xtype->name) ;
     }
 
     // check the dimensions
@@ -83,21 +120,142 @@ GrB_Info GB_select          // C<M> = accum (C, select(A,k)) or select(A',k)
     int64_t tncols = (A_transpose) ? GB_NROWS (A) : GB_NCOLS (A) ;
     if (GB_NROWS (C) != tnrows || GB_NCOLS (C) != tncols)
     { 
-        return (GB_ERROR (GrB_DIMENSION_MISMATCH, (GB_LOG,
+        GB_ERROR (GrB_DIMENSION_MISMATCH,
             "Dimensions not compatible:\n"
-            "output is "GBd"-by-"GBd"\n"
-            "input is "GBd"-by-"GBd"%s",
+            "output is " GBd "-by-" GBd "\n"
+            "input is " GBd "-by-" GBd "%s",
             GB_NROWS (C), GB_NCOLS (C),
-            tnrows, tncols, A_transpose ? " (transposed)" : ""))) ;
+            tnrows, tncols, A_transpose ? " (transposed)" : "") ;
+    }
+
+    // check if op is (NE, EQ, GT, GE, LT, LE)_THUNK or VALUE*
+    bool op_is_thunk_comparator =
+        (opcode >= GB_VALUENE_idxunop_code && opcode <= GB_VALUELE_idxunop_code)
+     || (opcode >= GB_NE_THUNK_selop_code && opcode <= GB_LE_THUNK_selop_code) ;
+
+    // check if op is TRIL, TRIU, DIAG, OFFDIAG, ROW/COL/DIAGINDEX
+    bool op_is_positional = GB_OPCODE_IS_POSITIONAL (opcode) ;
+
+    // check if op is user-defined
+    bool op_is_user_defined =
+        (opcode == GB_USER_selop_code) ||
+        (opcode == GB_USER_idxunop_code) ;
+
+    int64_t nz_thunk = 0 ;
+    GrB_Type ttype = NULL ;
+
+    if (Thunk != NULL)
+    {
+        // finish any pending work on the Thunk
+        ttype = Thunk->type ;
+        GB_MATRIX_WAIT (Thunk) ;
+        nz_thunk = GB_nnz ((GrB_Matrix) Thunk) ;
+        ASSERT (nz_thunk == 0 || nz_thunk == 1) ;
+        tcode = ttype->code ;
+
+        // if op is positional, Thunk must be compatible with GrB_INT64 (both
+        // GxB_SelectOp and GrB_IndexUnaryOp)
+        if (op_is_positional && !GB_Type_compatible (GrB_INT64, ttype))
+        { 
+            // Thunk not a built-in type, for a built-in select operator
+            GB_ERROR (GrB_DOMAIN_MISMATCH,
+                "Incompatible type for C=%s(A,Thunk):\n"
+                "input Thunk type [%s]\n"
+                "not compatible with GrB_INT64 input to built-in operator %s",
+                op->name, ttype->name, op->name) ;
+        }
+
+        // if op is (NE, EQ, GT, GE, LT, LE)_THUNK, then Thunk must be
+        // compatible with the matrix type
+        if (op_is_thunk_comparator)
+        {
+            if (op_is_selectop && !GB_Type_compatible (A->type, ttype))
+            { 
+                GB_ERROR (GrB_DOMAIN_MISMATCH,
+                    "Incompatible type for C=%s(A,Thunk):\n"
+                    "input A type [%s] and Thunk type [%s] not compatible",
+                    op->name, A->type->name, ttype->name) ;
+            }
+        }
+    }
+
+    if (op_is_idxunop)
+    {
+        // check the GrB_IndexUnaryOp
+        if (nz_thunk == 0)
+        { 
+            // Thunk cannot be empty for GrB_select
+            GB_ERROR (GrB_EMPTY_OBJECT, "Thunk for C=%s(A,Thunk)"
+                " cannot be an empty scalar\n", op->name) ;
+        }
+        if (!GB_Type_compatible (GrB_BOOL, op->ztype))
+        { 
+            // GrB_IndexUnaryOp ztype must be compatible with GrB_BOOL
+            GB_ERROR (GrB_DOMAIN_MISMATCH,
+                "Output of user-defined IndexUnaryOp %s is %s\n"
+                "which cannot be typecasted to bool\n",
+                op->name, op->ztype->name) ;
+        }
+        if (!GB_Type_compatible (ttype, op->ytype))
+        { 
+            // Thunk must be typecasted to the op->ytype
+            GB_ERROR (GrB_DOMAIN_MISMATCH,
+                "Incompatible type for C=%s(A,Thunk):\n"
+                "input Thunk type [%s] and op thunk type [%s]"
+                " not compatible",
+                op->name, ttype->name, op->ytype->name) ;
+        }
+    }
+    else if (op_is_user_defined)
+    {
+        // for a user-defined selectop, Thunk must match the op->ytype exactly
+        if (op->ytype == NULL && Thunk != NULL)
+        { 
+            // select operator does not take a Thunk, but one is present
+            GB_ERROR (GrB_DOMAIN_MISMATCH,
+                "User-defined operator %s(A,Thunk) does not take a Thunk\n"
+                "input, but Thunk parameter is non-NULL", op->name) ;
+        }
+        else if (op->ytype != NULL && Thunk == NULL)
+        { 
+            // select operator takes a Thunk, but Thunk parameter is missing
+            GB_ERROR (GrB_NULL_POINTER,
+                "Required argument is null: [%s]", "Thunk") ;
+        }
+        else if (op->ytype != NULL && Thunk != NULL)
+        {
+            // select operator takes a Thunk, and it is present on input.
+            // The types must match exactly.
+            if (op->ytype != ttype)
+            { 
+                GB_ERROR (GrB_DOMAIN_MISMATCH,
+                    "User-defined operator %s(A,Thunk) has a Thunk input\n"
+                    "type of [%s], which must exactly match the type of the\n"
+                    "Thunk parameter; parameter has type [%s]",
+                    op->name, op->ytype->name, ttype->name) ;
+            }
+            if (nz_thunk != 1)
+            { 
+                GB_ERROR (GrB_EMPTY_OBJECT,
+                    "User-defined operator %s(A,Thunk) has a Thunk input,\n"
+                    "which must not be empty", op->name) ;
+            }
+        }
     }
 
     // quick return if an empty mask is complemented
-    GB_RETURN_IF_QUICK_MASK (C, C_replace, M, Mask_comp) ;
+    GB_RETURN_IF_QUICK_MASK (C, C_replace, M, Mask_comp, Mask_struct) ;
 
+    //--------------------------------------------------------------------------
     // delete any lingering zombies and assemble any pending tuples
-    GB_WAIT (C) ;
-    GB_WAIT (M) ;
-    GB_WAIT (A) ;
+    //--------------------------------------------------------------------------
+
+    GB_MATRIX_WAIT (M) ;        // TODO: delay until accum/mask phase
+    GB_MATRIX_WAIT (A) ;        // TODO: could tolerate jumbled in some cases
+
+    GB_BURBLE_DENSE (C, "(C %s) ") ;
+    GB_BURBLE_DENSE (M, "(M %s) ") ;
+    GB_BURBLE_DENSE (A, "(A %s) ") ;
 
     //--------------------------------------------------------------------------
     // handle the CSR/CSC format and the transposed case
@@ -122,243 +280,450 @@ GrB_Info GB_select          // C<M> = accum (C, select(A,k)) or select(A',k)
     // do not match, GB_accum_mask transposes T, computing C<M>=accum(C,T').
 
     //--------------------------------------------------------------------------
-    // get the opcode and change it if needed
+    // change the opcode if needed
     //--------------------------------------------------------------------------
 
-    GB_Select_Opcode opcode = op->opcode ;
+    bool flipij = !A_csc ;
 
-    if (!A_csc)
-    {
+    ASSERT_SCALAR_OK_OR_NULL (Thunk, "Thunk now GB_select", GB0) ;
+
+    // if A is boolean, get the value of Thunk typecasted to boolean
+    bool bthunk = false ;
+
+    // if Thunk is not present, or has no entries, then k defaults to zero
+    int64_t ithunk = 0 ;        // ithunk = (int64_t) Thunk (0)
+
+    if (nz_thunk > 0 && GB_Type_compatible (GrB_INT64, ttype))
+    { 
+        // ithunk = (int64_t) Thunk
+        GB_cast_scalar (&ithunk, GB_INT64_code, Thunk->x, tcode,
+            sizeof (int64_t)) ;
+        // bthunk = (bool) Thunk
+        bthunk = (ithunk != 0) ;
+    }
+
+    bool thunk_is_zero = false ;
+    if (nz_thunk > 0)
+    { 
+        thunk_is_zero = !GB_is_nonzero ((GB_void *) Thunk->x, ttype->size) ;
+    }
+
+    bool make_copy = false ;
+    bool is_empty = false ;
+
+    if (op_is_positional)
+    { 
+
+        //----------------------------------------------------------------------
+        // replace idxunop with their corresponding selectop positional ops
+        //----------------------------------------------------------------------
+
+        switch (opcode)
+        {
+            case GB_TRIL_idxunop_code : 
+                opcode = GB_TRIL_selop_code ;
+                break ;
+            case GB_TRIU_idxunop_code : 
+                opcode = GB_TRIU_selop_code ;
+                break ;
+            case GB_DIAG_idxunop_code : 
+                opcode = GB_DIAG_selop_code ;
+                break ;
+            case GB_DIAGINDEX_idxunop_code : 
+            case GB_OFFDIAG_idxunop_code : 
+                opcode = GB_OFFDIAG_selop_code ;
+                break ;
+            default:;
+        }
+
+        // The only remaining positional GrB_IndexUnaryOps are:
+        // ROWINDEX, COLINDEX, COLLE, COLGT, ROWLE, and ROWGT.
+
+        // These GrB_IndexUnaryOps are distinct from any GxB_SelectOps, but act
+        // just like all positional GxB_SelectOps (TRIL, TRIU, etc), so the
+        // same code base can handle both kinds of positional ops.  No
+        // typecasting needs to be performed.
+
+        //----------------------------------------------------------------------
+        // tril, triu, diag, offdiag, ...: get k and handle the flip
+        //----------------------------------------------------------------------
+
         // The built-in operators are modified so they can always work as if A
         // were in CSC format.  If A is not in CSC, then the operation is
         // flipped.
-        // diag(A,k)    becomes diag(A,-k)
-        // offdiag(A,k) becomes offdiag(A,-k)
-        // tril(A,k)    becomes triu(A,-k)
-        // triu(A,k)    becomes tril(A,-k)
-        // nonzero(A)   is unchanged
-        // userop(A)    row/col indices and dimensions are swapped
-        if (opcode < GB_NONZERO_opcode)
-        {
-            kk = -kk ;
-            if (opcode == GB_TRIL_opcode)
-            { 
-                opcode = GB_TRIU_opcode ;
+
+        if (flipij)
+        { 
+            switch (opcode)
+            {
+                // TRIL becomes TRIU with thunk negated
+                case GB_TRIL_selop_code : 
+                    ithunk = -ithunk ;
+                    opcode = GB_TRIU_selop_code ;
+                    break ;
+
+                // TRIU becomes TRIL with thunk negated
+                case GB_TRIU_selop_code : 
+                    ithunk = -ithunk ;
+                    opcode = GB_TRIL_selop_code ;
+                    break ;
+
+                // DIAG and OFFDIAG: same opcode, but negate the thunk
+                case GB_DIAG_selop_code : 
+                case GB_OFFDIAG_selop_code : 
+                    ithunk = -ithunk ;
+                    break ;
+
+                // ROWINDEX becomes COLINDEX
+                case GB_ROWINDEX_idxunop_code  : 
+                    // i+thunk becomes j+thunk: no change to thunk
+                    opcode = GB_COLINDEX_idxunop_code ;
+                    break ;
+
+                // COLINDEX becomes ROWINDEX
+                case GB_COLINDEX_idxunop_code  : 
+                    // j+thunk becomes i+thunk: no change to thunk
+                    opcode = GB_ROWINDEX_idxunop_code ;
+                    break ;
+
+                // COLLE becomes ROWLE
+                case GB_COLLE_idxunop_code : 
+                    // j <= thunk becomes i <= thunk: no change to thunk
+                    opcode = GB_ROWLE_idxunop_code ;
+                    break ;
+
+                // COLGT becomes ROWGT
+                case GB_COLGT_idxunop_code : 
+                    // j > thunk becomes i > thunk: no change to thunk
+                    opcode = GB_ROWGT_idxunop_code ;
+                    break ;
+
+                // ROWLE becomes COLLE
+                case GB_ROWLE_idxunop_code : 
+                    // i <= thunk becomes j <= thunk: no change to thunk
+                    opcode = GB_COLLE_idxunop_code ;
+                    break ;
+
+                // ROWGT becomes COLGT
+                case GB_ROWGT_idxunop_code : 
+                    // i > thunk becomes j > thunk: no change to thunk
+                    opcode = GB_COLGT_idxunop_code ;
+                    break ;
+
+                default:;
             }
-            else if (opcode == GB_TRIU_opcode)
-            { 
-                opcode = GB_TRIL_opcode ;
-            }
-        }
-    }
 
-    //--------------------------------------------------------------------------
-    // T = select(A,k)
-    //--------------------------------------------------------------------------
-
-    int64_t vlen = A->vlen ;
-    int64_t vdim = A->vdim ;
-    int64_t tnzmax = (opcode == GB_DIAG_opcode) ?
-        GB_IMIN (vlen,vdim) : GB_NNZ (A) ;
-
-    // [ create T in same format as A_csc, with just as many non-empty vectors,
-    // and same hypersparsity as A
-    GrB_Matrix T = NULL ;           // allocate a new header for T
-    GB_CREATE (&T, A->type, A->vlen, A->vdim, GB_Ap_malloc, A_csc,
-        GB_SAME_HYPER_AS (A->is_hyper), A->hyper_ratio, A->nvec_nonempty,
-        tnzmax, true) ;
-    if (info != GrB_SUCCESS)
-    { 
-        // out of memory
-        return (info) ;
-    }
-
-    int64_t *restrict Ti = T->i ;
-    GB_void *restrict Tx = T->x ;
-
-    const int64_t *restrict Ai = A->i ;
-    const GB_void *restrict Ax = A->x ;
-
-    int64_t asize = A->type->size ;
-
-    // start the construction of T
-    int64_t jlast, tnz, tnz_last ;
-    GB_jstartup (T, &jlast, &tnz, &tnz_last) ;
-
-    // keep an entry that satisfies a condition, copying it from A to T:
-    #define GB_KEEP_IF(condition)                                   \
-        if (condition)                                              \
-        {                                                           \
-            Ti [tnz] = i ;                                          \
-            memcpy (Tx +(tnz*asize), Ax +(p*asize), asize) ;        \
-            tnz++ ;                                                 \
+            flipij = false ;
         }
 
-    switch (opcode)
+        // flipij is now false for any positional operator
+
+    }
+    else
     {
 
         //----------------------------------------------------------------------
-        // T = tril (A,k)
+        // replace GrB_IndexUnaryOp with GxB_SelectOp if no typecasting
         //----------------------------------------------------------------------
 
-        case GB_TRIL_opcode:
-        {
-            GB_for_each_vector (A)
+        if (op_is_idxunop && A->type == op->xtype)
+        { 
+            // If there is no typecasting of the A matrix, the VALUE* operators
+            // are identical to their selectop counterparts.  The GxB_SelectOps
+            // never typecast the input matrix A, but do their tests on the
+            // original type of A, after typecasting the thunk scalar to the
+            // type of A if needed.  If A->type and op->xtype are the same for
+            // a GrB_IndexUnaryOp, then no typecasting occurs at all, neither
+            // for A nor the thunk scalar.  After this conversion, the VALUE*
+            // operators are only applied in the generic select method.
+            switch (opcode)
             {
-                int64_t GBI1_initj (Iter, j, p, pend) ;
-                // an entry is kept if (j-i) <= kk, so smallest i is j-kk.
-                int64_t ifirst = j - kk ;
-                if (ifirst < vlen)
+                case GB_VALUENE_idxunop_code : 
+                    opcode = GB_NE_THUNK_selop_code ;
+                    break ;
+                case GB_VALUEEQ_idxunop_code : 
+                    opcode = GB_EQ_THUNK_selop_code ;
+                    break ;
+                case GB_VALUEGT_idxunop_code : 
+                    opcode = GB_GT_THUNK_selop_code ;
+                    break ;
+                case GB_VALUEGE_idxunop_code : 
+                    opcode = GB_GE_THUNK_selop_code ;
+                    break ;
+                case GB_VALUELT_idxunop_code : 
+                    opcode = GB_LT_THUNK_selop_code ;
+                    break ;
+                case GB_VALUELE_idxunop_code : 
+                    opcode = GB_LE_THUNK_selop_code ;
+                    break ;
+                default:;
+            }
+        }
+
+        //----------------------------------------------------------------------
+        // rename THUNK comparators if thunk is zero
+        //----------------------------------------------------------------------
+
+        if (thunk_is_zero)
+        { 
+            switch (opcode)
+            {
+                case GB_NE_THUNK_selop_code : 
+                    opcode = GB_NONZERO_selop_code ;
+                    break ;
+                case GB_EQ_THUNK_selop_code : 
+                    opcode = GB_EQ_ZERO_selop_code ;
+                    break ;
+                case GB_GT_THUNK_selop_code : 
+                    opcode = GB_GT_ZERO_selop_code ;
+                    break ;
+                case GB_GE_THUNK_selop_code : 
+                    opcode = GB_GE_ZERO_selop_code ;
+                    break ;
+                case GB_LT_THUNK_selop_code : 
+                    opcode = GB_LT_ZERO_selop_code ;
+                    break ;
+                case GB_LE_THUNK_selop_code : 
+                    opcode = GB_LE_ZERO_selop_code ;
+                    break ;
+                default:;
+            }
+        }
+
+        //----------------------------------------------------------------------
+        // (NE, EQ, GT, GE, LT, LE) x (0, thunk): handle bool and uint cases
+        //----------------------------------------------------------------------
+
+        switch (opcode)
+        {
+
+            case GB_GT_ZERO_selop_code   :  // A(i,j) > 0
+
+                // bool and uint: rename GxB_GT_ZERO to GxB_NONZERO
+                switch (acode)
                 {
-                    int64_t pright = pend - 1 ;
-                    GB_BINARY_TRIM_SEARCH (ifirst, Ai, p, pright) ;
-                    for ( ; p < pend ; p++)
-                    { 
-                        int64_t i = Ai [p] ;
-                        GB_KEEP_IF ((j-i) <= kk) ;
-                    }
+                    case GB_BOOL_code   :   // C is iso, if boolean
+                    case GB_UINT8_code  :   // C is not iso if uint*
+                    case GB_UINT16_code : 
+                    case GB_UINT32_code : 
+                    case GB_UINT64_code : 
+                        opcode = GB_NONZERO_selop_code ; break ;
+                    default: ;
                 }
-                info = GB_jappend (T, j, &jlast, tnz, &tnz_last, Context) ;
-                ASSERT (info == GrB_SUCCESS) ;
-            }
-        }
+                break ;
 
-        break ;
+            case GB_GE_ZERO_selop_code   :  // A(i,j) >= 0
 
-        //----------------------------------------------------------------------
-        // T = triu (A,k)
-        //----------------------------------------------------------------------
-
-        case GB_TRIU_opcode:
-        {
-            GB_for_each_vector (A)
-            {
-                GB_for_each_entry (j, p, pend)
-                { 
-                    int64_t i = Ai [p] ;
-                    GB_KEEP_IF ((j-i) >= kk) else break ;
-                }
-                info = GB_jappend (T, j, &jlast, tnz, &tnz_last, Context) ;
-                ASSERT (info == GrB_SUCCESS) ;
-            }
-        }
-        break ;
-
-        //----------------------------------------------------------------------
-        // T = diag (A,k)
-        //----------------------------------------------------------------------
-
-        case GB_DIAG_opcode:
-        {
-            GB_for_each_vector (A)
-            {
-                // use binary search to find the entry on the kk-th diagonal:
-                // look for entry A(i,j) with index i = j-kk
-                int64_t GBI1_initj (Iter, j, p, pend) ;
-                int64_t i = j-kk ;
-                if (i < 0 || i >= vlen) continue ;
-                bool found ;
-                if (pend - p == vlen)
-                { 
-                    // A(:,j) is dense
-                    found = true ;
-                    p += i ;
-                }
-                else
-                { 
-                    int64_t pright = pend - 1 ;
-                    GB_BINARY_SEARCH (i, Ai, p, pright, found) ;
-                }
-                GB_KEEP_IF (found) ;
-                info = GB_jappend (T, j, &jlast, tnz, &tnz_last, Context) ;
-                ASSERT (info == GrB_SUCCESS) ;
-            }
-        }
-        break ;
-
-        //----------------------------------------------------------------------
-        // T = offdiag (A,k)
-        //----------------------------------------------------------------------
-
-        case GB_OFFDIAG_opcode:
-        {
-            GB_for_each_vector (A)
-            {
-                GB_for_each_entry (j, p, pend)
-                { 
-                    int64_t i = Ai [p] ;
-                    GB_KEEP_IF ((j-i) != kk) ;
-                }
-                info = GB_jappend (T, j, &jlast, tnz, &tnz_last, Context) ;
-                ASSERT (info == GrB_SUCCESS) ;
-            }
-        }
-        break ;
-
-        //----------------------------------------------------------------------
-        // T = nonzero (A,k)
-        //----------------------------------------------------------------------
-
-        case GB_NONZERO_opcode:
-        {
-            GB_for_each_vector (A)
-            {
-                GB_for_each_entry (j, p, pend)
-                { 
-                    int64_t i = Ai [p] ;
-                    GB_KEEP_IF (is_nonzero (Ax +(p*asize), asize)) ;
-                }
-                info = GB_jappend (T, j, &jlast, tnz, &tnz_last, Context) ;
-                ASSERT (info == GrB_SUCCESS) ;
-            }
-        }
-        break ;
-
-        //----------------------------------------------------------------------
-        // T = userselect (A,k)
-        //----------------------------------------------------------------------
-
-        case GB_USER_SELECT_C_opcode:
-        case GB_USER_SELECT_R_opcode:
-        {
-            GxB_select_function select = (GxB_select_function) (op->function) ;
-            GB_for_each_vector (A)
-            {
-                GB_for_each_entry (j, p, pend)
+                // bool and uint: always true; use GB_dup_worker
+                switch (acode)
                 {
-                    int64_t i = Ai [p] ;
-                    bool keep ;
-                    if (A_csc)
+                    case GB_BOOL_code   : 
+                    case GB_UINT8_code  : 
+                    case GB_UINT16_code : 
+                    case GB_UINT32_code : 
+                    case GB_UINT64_code : 
+                        make_copy = true ; break ;
+                    default: ;
+                }
+                break ;
+
+            case GB_LT_ZERO_selop_code   :  // A(i,j) < 0
+
+                // bool and uint: always false; return an empty matrix
+                switch (acode)
+                {
+                    case GB_BOOL_code   : 
+                    case GB_UINT8_code  : 
+                    case GB_UINT16_code : 
+                    case GB_UINT32_code : 
+                    case GB_UINT64_code : 
+                        is_empty = true ; break ;
+                    default: ;
+                }
+                break ;
+
+            case GB_LE_ZERO_selop_code   :  // A(i,j) <= 0
+
+                // bool and uint: rename GxB_LE_ZERO to GxB_EQ_ZERO
+                switch (acode)
+                {
+                    case GB_BOOL_code   : 
+                    case GB_UINT8_code  : 
+                    case GB_UINT16_code : 
+                    case GB_UINT32_code : 
+                    case GB_UINT64_code : 
+                        // C is iso for boolean and uint* cases
+                        opcode = GB_EQ_ZERO_selop_code ; break ;
+                    default: ;
+                }
+                break ;
+
+            case GB_NE_THUNK_selop_code   : // A(i,j) != thunk
+
+                // bool: if thunk is true,  rename GxB_NE_THUNK to GxB_EQ_ZERO 
+                //       if thunk is false, rename GxB_NE_THUNK to GxB_NONZERO 
+                if (acode == GB_BOOL_code)
+                { 
+                    // C is iso boolean, in both cases
+                    opcode = (bthunk) ?
+                        GB_EQ_ZERO_selop_code : GB_NONZERO_selop_code ;
+                }
+                break ;
+
+            case GB_EQ_THUNK_selop_code   : // A(i,j) == thunk
+
+                // bool: if thunk is true,  rename GxB_NE_THUNK to GxB_NONZERO 
+                //       if thunk is false, rename GxB_NE_THUNK to GxB_EQ_ZERO 
+                if (acode == GB_BOOL_code)
+                { 
+                    // C is iso boolean, in both cases
+                    opcode = (bthunk) ?
+                        GB_NONZERO_selop_code : GB_EQ_ZERO_selop_code ;
+                }
+                break ;
+
+            case GB_GT_THUNK_selop_code   : // A(i,j) > thunk
+
+                // bool: if thunk is true,  return an empty matrix
+                //       if thunk is false, rename GxB_GT_THUNK to GxB_NONZERO
+                // user type: return error above
+                if (acode == GB_BOOL_code)
+                {
+                    if (bthunk)
                     { 
-                        keep = select (i, j, vlen, vdim, Ax +(p*asize), k) ;
+                        is_empty = true ;
                     }
                     else
                     { 
-                        keep = select (j, i, vdim, vlen, Ax +(p*asize), k) ;
+                        // C is iso boolean
+                        opcode = GB_NONZERO_selop_code ;
                     }
-                    GB_KEEP_IF (keep) ;
                 }
-                info = GB_jappend (T, j, &jlast, tnz, &tnz_last, Context) ;
-                ASSERT (info == GrB_SUCCESS) ;
-            }
+                break ;
+
+            case GB_GE_THUNK_selop_code   : // A(i,j) >= thunk
+
+                // bool: if thunk is true,  rename GxB_GE_THUNK to GxB_NONZERO
+                //       if thunk is false, use GB_dup_worker
+                // user type: return error above
+                if (acode == GB_BOOL_code)
+                {
+                    if (bthunk)
+                    { 
+                        // C is iso boolean
+                        opcode = GB_NONZERO_selop_code ;
+                    }
+                    else
+                    { 
+                        // use dup for GE_THUNK if thunk is false
+                        make_copy = true ;
+                    }
+                }
+                break ;
+
+            case GB_LT_THUNK_selop_code   : // A(i,j) < thunk
+
+                // bool: if thunk is true,  rename GxB_LT_THUNK to GxB_EQ_ZERO
+                //       if thunk is false, return an empty matrix
+                // user type: return error above
+                if (acode == GB_BOOL_code)
+                {
+                    if (bthunk)
+                    { 
+                        // C is iso boolean
+                        opcode = GB_EQ_ZERO_selop_code ;
+                    }
+                    else
+                    { 
+                        // matrix empty for LT_THUNK_BOOL, if thunk false
+                        is_empty = true ;
+                    }
+                }
+                break ;
+
+            case GB_LE_THUNK_selop_code   : // A(i,j) <= thunk
+
+                // bool: if thunk is true,  use GB_dup_worker
+                //       if thunk is false, rename GxB_LE_ZERO to GxB_EQ_ZERO
+                // user type: return error
+                if (acode == GB_BOOL_code)
+                {
+                    if (bthunk)
+                    { 
+                        // use dup for LE_THUNK if thunk is true
+                        make_copy = true ;
+                    }
+                    else
+                    { 
+                        // C is iso boolean
+                        opcode = GB_EQ_ZERO_selop_code ;
+                    }
+                }
+                break ;
+
+            default : ;     // use the opcode as-is
         }
-        break ;
-
-        default:
-            ASSERT (false) ;
-            break ;
-
     }
 
-    ASSERT (info == GrB_SUCCESS) ;
-    GB_jwrapup (T, jlast, tnz) ;        // T->p is now finalized ]
-    ASSERT_OK (GB_check (T, "T=select(A,k)", GB0)) ;
+    if (!op_is_user_defined)
+    { 
+        // flipij can still be true but is only needed for if the op
+        // (GrB_IndexUnaryOp or GxB_SelectOp) is user-defined.  So set here it
+        // to false for all but user-defined op.
+        flipij = false ;
+    }
+
+    //--------------------------------------------------------------------------
+    // create T
+    //--------------------------------------------------------------------------
+
+    GB_CLEAR_STATIC_HEADER (T, &T_header) ;
+
+    if (make_copy)
+    { 
+        // selectop is always true, so T = A
+        // set T->iso = A->iso  OK
+        GB_OK (GB_shallow_copy (T, A_csc, A, Context)) ;
+    }
+    else if (is_empty)
+    { 
+        // selectop is always false, so T is an empty non-iso matrix
+        GB_OK (GB_new (&T, // auto (sparse or hyper), existing header
+            A->type, A->vlen, A->vdim, GB_Ap_calloc, A_csc,
+            GxB_SPARSE + GxB_HYPERSPARSE, GB_Global_hyper_switch_get ( ),
+            1, Context)) ;
+    }
+    else
+    { 
+        // T = select (A, Thunk)
+        GrB_Scalar Thunk2 = NULL ;
+        if (nz_thunk > 0 && (op_is_thunk_comparator || op_is_user_defined))
+        {
+            // the GrB_Scalar Thunk is passed to GB_selector only if the
+            // operator is a thunk comparator (EQ, NE, GT, GE, LT, LE),
+            // or if the operator is user-defined.
+            Thunk2 = Thunk ;
+        }
+        GB_OK (GB_selector (
+            T,          // output matrix
+            opcode,     // opcode of the operator
+            op,         // the GB_Operator itself
+            flipij,     // if true, flip i and j for user-defined operator
+            A,          // input matrix
+            ithunk,     // thunk typecasted to int64_t
+            Thunk2,     // NULL, or the GrB_Scalar Thunk
+            Context)) ;
+    }
+
+    T->is_csc = A_csc ;
+    ASSERT_MATRIX_OK (T, "T=select(A,Thunk) output", GB0) ;
+    ASSERT_MATRIX_OK (C, "C for accum; T=select(A,Thunk) output", GB0) ;
 
     //--------------------------------------------------------------------------
     // C<M> = accum (C,T): accumulate the results into C via the mask
     //--------------------------------------------------------------------------
 
     return (GB_accum_mask (C, M, NULL, accum, &T, C_replace, Mask_comp,
-        Context)) ;
+        Mask_struct, Context)) ;
 }
 

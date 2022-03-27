@@ -1,12 +1,16 @@
 function test73
 %TEST73 performance of C = A*B, with mask
 
-% SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2018, All Rights Reserved.
-% http://suitesparse.com   See GraphBLAS/Doc/License.txt for license.
+% SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2022, All Rights Reserved.
+% SPDX-License-Identifier: Apache-2.0
 
 fprintf ('\n----------------- C=A*B performance\n') ;
 
-clear
+[save save_chunk] = nthreads_get ;
+chunk = 4096 ;
+nthreads = feature_numcores ;
+nthreads_set (nthreads, chunk) ;
+
 Prob = ssget (1338)
 A = Prob.A ;
 
@@ -43,14 +47,14 @@ fprintf ('mxm, no mask %g\n', t1) ;
 tic
 C2 = L*L ;
 t2 = toc ;
-fprintf ('MATLAB, no mask %g\n', t2) ;
+fprintf ('built-in, no mask %g\n', t2) ;
 
 % with mask ---------------------------------------------
 
 tic
 C2b = (L*L) .* L ;
 t2 = toc ;
-fprintf ('MATLAB, mask %g\n', t2) ;
+fprintf ('built-in, mask %g\n', t2) ;
 
 tic
 C3 = GB_mex_mxm  (Cin, L, [ ], semiring, L, L, dnn);
@@ -77,3 +81,4 @@ assert (isequal (C2, C1.matrix)) ;
 assert (isequal (C2 .* spones (L), C3.matrix)) ;
 assert (isequal (C2, C4.matrix)) ;
 assert (isequal (C2b, C5.matrix)) ;
+nthreads_set (save, save_chunk) ;

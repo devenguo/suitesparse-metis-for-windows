@@ -1,8 +1,8 @@
 function test41
 %TEST41 test AxB
 
-% SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2018, All Rights Reserved.
-% http://suitesparse.com   See GraphBLAS/Doc/License.txt for license.
+% SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2022, All Rights Reserved.
+% SPDX-License-Identifier: Apache-2.0
 
 fprintf ('\n -------------- simple GB_mex_AxB numeric tests\n') ;
 
@@ -34,7 +34,7 @@ for at = [false true]
 
                 fprintf ('\nat %d bt %d ct %d\n', at, bt, ct) ;
 
-                fprintf ('matlab:  ') ;
+                fprintf ('built-in:  ') ;
                 tic
                 if (at)
                     if (bt)
